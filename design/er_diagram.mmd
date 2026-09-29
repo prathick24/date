@@ -26,7 +26,7 @@ erDiagram
         INT person_id FK "NOT NULL refs people"
         VARCHAR_20 source "NOT NULL CHECK (linkedin, instagram)"
         VARCHAR_500 source_url "NOT NULL"
-        VARCHAR_40 winning_strategy "NULL CHECK (li_direct, li_jina_reader, li_jina_reader_json, ig_web_profile_info, ig_embed, ig_jina_reader)"
+        VARCHAR_40 winning_strategy "NULL CHECK (li_jina_reader, li_direct, li_browser_render, ig_browser_render, ig_web_profile_info, ig_embed, ig_jina_reader)"
         INT http_status "NULL e.g. 200, 999, 429"
         TEXT raw_text "NULL normalised extracted text"
         JSONB profile_fields "NULL structured fields name/bio/headline/followers"

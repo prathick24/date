@@ -2,31 +2,84 @@ openapi: 3.0.3
 info:
   title: Agentic Dating Site — External API Dependencies
   description: >
-    Documents every outbound call the platform makes. These are the upstream
-    systems that determine what the scraping layer can and cannot achieve.
+    Documents every outbound call the platform makes, and — more usefully —
+    records what each one actually returned when it was probed. These probes
+    were run from a residential IP on 2026-09-29 and are the reason the
+    strategy chains look the way they do.
 
-    Summary of observed platform behaviour (verified by probe):
+    The headline finding: **the obvious way in does not work, and the
+    non-obvious way in works for only one of the two platforms.**
 
-    | Target                | Direct fetch | Result                                              |
-    |-----------------------|--------------|-----------------------------------------------------|
-    | Instagram public page | BLOCKED      | Serves a login wall. No OG tags, no bio in the HTML. |
-    | Instagram web API     | WORKS*       | Full JSON, but rate limited to 429 from many IPs.    |
-    | Instagram embed page  | PARTIAL      | HTTP 200 but returns the same shell as the page.    |
-    | LinkedIn public page  | BLOCKED      | HTTP 999 — explicit bot block.                      |
-    | LinkedIn via reader   | WORKS        | Full rendered markdown of the public profile.       |
+    | Target                | Plain HTTP fetch            | Headless browser render    |
+    |-----------------------|-----------------------------|----------------------------|
+    | Instagram public page | BLOCKED — 640KB shell, zero `og:description`, zero `"biography"` | **WORKS** — real biography, name, follower counts |
+    | Instagram web API     | 429 sustained at 1 req/20s  | n/a                        |
+    | Instagram embed page  | 200, same shell, no data    | n/a                        |
+    | LinkedIn public page  | BLOCKED — HTTP 999          | BLOCKED — `Sign Up \| LinkedIn` authwall |
+    | LinkedIn via reader   | 200 with API key; 403 Cloudflare challenge without one | still challenged |
 
-    Because no single method works for both platforms, ingestion runs an
-    ordered Strategy chain per source and records which strategy won.
-    The chains are:
+    Consequences encoded in the design:
 
-      linkedin : li_direct -> li_jina_reader -> li_jina_reader_json
-      instagram: ig_web_profile_info -> ig_embed -> ig_jina_reader
+      linkedin : li_jina_reader -> li_direct -> li_browser_render
+      instagram: ig_browser_render -> ig_web_profile_info -> ig_embed -> ig_jina_reader
 
-    Success is decided by CONTENT, not by status code: an HTTP 200 carrying
-    a login wall is recorded as `blocked`, not `success`.
+    Two rules follow from the probes and are enforced in code:
+
+      1. Success is decided by CONTENT, not status code. An HTTP 200
+         carrying a login wall is recorded as `blocked`, not `success`.
+      2. Every attempt is recorded, including skipped and failed ones, so
+         "we could not read this" is always explainable.
   version: 1.0.0
 
 paths:
+
+  # ══════════════════════════════════════════════════
+  # RENDERER — Playwright over the host's installed Chromium
+  # src/client/render_client.py
+  # ══════════════════════════════════════════════════
+
+  render:
+    post:
+      tags: [Renderer]
+      summary: STRATEGY 1 (primary) for Instagram — headless render
+      description: >
+        Navigates a real browser to the target URL, waits for the page to
+        hydrate, and returns the rendered HTML. This is the only route that
+        returns Instagram profile data on a throttled network, and it is the
+        single most important finding of the probing work.
+
+        Playwright drives the Chromium **already installed on the host**
+        (Edge on Windows, system Chrome elsewhere) via `channel`, so no
+        browser download is needed and the deployment image stays small.
+
+        Data is read from the embedded JSON island that Instagram's own
+        frontend hydrates — `"biography"`, `"full_name"`, follower counts —
+        rather than from CSS selectors, so extraction survives layout
+        changes.
+
+        Costs 6-8s per page and roughly 1000x the memory of an HTTP request,
+        which is why it runs under its own `asyncio.Semaphore(2)` with a
+        shared browser and a bounded page pool.
+      operationId: renderPage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, example: 'https://www.instagram.com/nasa/' }
+                wait_for: { type: string, default: 'body' }
+                timeout_ms: { type: integer, default: 30000 }
+      responses:
+        '200':
+          description: Rendered HTML
+          content:
+            text/html:
+              schema: { type: string }
+        '000':
+          description: Navigation timeout, DNS failure, or browser launch failure
 
   # ══════════════════════════════════════════════════
   # INSTAGRAM — src/client/instagram_client.py
@@ -35,20 +88,22 @@ paths:
   /api/v1/users/web_profile_info/:
     get:
       tags: [Instagram]
-      summary: STRATEGY 1 (primary) — public web profile API
+      summary: STRATEGY 2 — public web profile API
       description: >
         The undocumented endpoint Instagram's own website calls to render a
         public profile. Returns the complete profile as JSON: full name,
         biography, follower and following counts, media count, external URL,
         category, and whether the account is private.
 
-        This is the only Instagram route that returns real profile data
-        without authentication. It is rate limited — probes from a single IP
-        receive HTTP 429, which is a throttle and not an auth failure, so
-        exponential backoff is the correct response.
+        Returns real data when the caller's IP is not throttled, and is
+        roughly 100x cheaper than a browser render — so on a clean network
+        it is the better primary, and the chain order is configurable by
+        environment variable. On the probe IP it returned 429 consistently,
+        including at one request per 20 seconds over several minutes, so
+        there it is a fallback rather than a primary.
 
         Required: header `x-ig-app-id: 936619743392459`, the public web app
-        identifier. Without it the request is rejected.
+        identifier.
       operationId: getInstagramWebProfile
       parameters:
         - name: username
@@ -87,22 +142,24 @@ paths:
         '401':
           description: Public app id header missing or rejected
         '429':
-          description: Rate limited. Retryable with exponential backoff.
+          description: Rate limited. Retryable with exponential backoff, but persistent if the IP is throttled.
         '404':
           description: Handle does not exist or the account is private
 
   /{username}/:
     get:
       tags: [Instagram]
-      summary: STRATEGY 0 (attempted, expected to fail) — direct profile page
+      summary: Strategy (not in chain) — direct profile page over plain HTTP
       description: >
-        Attempted first because it is the simplest call. Returns HTTP 200 with
-        a ~640KB JavaScript shell that contains no profile data: zero
-        occurrences of `og:description`, zero occurrences of `"biography"`.
-        The unauthenticated response is a login wall.
+        Recorded because it was the original assumption and it is worth
+        documenting why it failed. Returns HTTP 200 with a ~640KB JavaScript
+        shell containing **zero** occurrences of `og:description` and **zero**
+        occurrences of `"biography"` — the unauthenticated response is a
+        login wall.
 
-        Retained in the chain because a non-rate-limited residential IP
-        occasionally receives server-rendered metadata instead.
+        This is exactly why the chain uses a browser render instead: the
+        profile data is not in the server response at all, it only exists
+        after client-side JavaScript runs.
       operationId: getInstagramPageDirect
       parameters:
         - name: username
@@ -111,20 +168,20 @@ paths:
           schema: { type: string, example: nasa }
       responses:
         '200':
-          description: HTML shell with no profile data — not usable
+          description: HTML shell with no profile data — not usable over plain HTTP
         '429':
           description: Rate limited
 
   /{username}/embed/:
     get:
       tags: [Instagram]
-      summary: STRATEGY 2 (fallback) — embedded profile
+      summary: STRATEGY 3 — embedded profile
       description: >
-        The embed route used for third-party site embeds. Currently returns
-        the same shell as the direct page on unauthenticated requests, so it
-        is a fallback for environments where the embed path is still served.
-        Response would be parsed for `og:description`, `og:title`, and the
-        embedded caption text.
+        The embed route used for third-party site embeds. On probe it
+        returned the same ~640KB shell as the direct page with no profile
+        data, so it is retained as a cheap third attempt rather than a
+        serious candidate. Response would be parsed for `og:description`,
+        `og:title`, and embedded caption text.
       operationId: getInstagramEmbed
       parameters:
         - name: username
@@ -144,17 +201,16 @@ paths:
   /in/{slug}:
     get:
       tags: [LinkedIn]
-      summary: STRATEGY 0 (attempted, blocked) — direct public profile
+      summary: STRATEGY 2 — direct public profile
       description: >
-        LinkedIn serves HTTP 999 to unauthenticated non-browser clients. This
-        is a deliberate, documented block — 999 is not a standard status code
-        and is returned in place of 403 so that automated clients cannot
+        LinkedIn serves HTTP 999 to unauthenticated non-browser clients.
+        This is a deliberate, documented block — 999 is not a standard status
+        code and is returned in place of 403 so automated clients cannot
         distinguish a ban from an authorisation error.
 
         The strategy is still attempted and its failure recorded, because
-        (a) the block is IP and header dependent, so it succeeds from some
-        networks, and (b) showing the grader the real failure is more honest
-        than hiding it.
+        the block is IP- and header-dependent, so it succeeds from some
+        networks.
       operationId: getLinkedinDirect
       parameters:
         - name: slug
@@ -163,7 +219,7 @@ paths:
           schema: { type: string, example: williamhgates }
       responses:
         '999':
-          description: Bot block. Not retryable. Escalate to the reader strategy.
+          description: Bot block. Not retryable. Escalate to the next strategy.
         '404':
           description: No such public profile
         '429':
@@ -171,53 +227,58 @@ paths:
 
   # ══════════════════════════════════════════════════
   # JINA READER — src/client/jina_client.py
-  # Shared by both platforms as the renderer-based fallback.
+  # Primary LinkedIn strategy. REQUIRED API KEY.
   # ══════════════════════════════════════════════════
 
   https://r.jina.ai/{target_url}:
     get:
       tags: [Jina Reader]
-      summary: STRATEGY 1 (primary for LinkedIn) — headless render to markdown
+      summary: STRATEGY 1 (primary for LinkedIn) — render to markdown
       description: >
         Fetches the target URL through Jina Reader, which renders the page in
         a headless browser and returns clean markdown.
 
-        **LinkedIn — verified working.** Requesting a public profile returns
-        ~77KB of markdown containing the headline, the About section, work
-        experience, education, and skills. This is the only reliable route to
-        LinkedIn profile content and it is the platform's primary LinkedIn
-        strategy.
+        **LinkedIn — works, with an API key.** Requesting a public profile
+        returned ~77KB of markdown containing the headline, the About
+        section, work experience, education, and skills.
+
+        **Without a key it is unusable.** Anonymous access is throttled by a
+        Cloudflare interstitial: HTTP 403 with a "Just a moment..." body. It
+        does not clear on retry, does not clear after a 60-second cooldown,
+        and does not clear in a real browser — a browser loaded the challenge
+        page and sat on "Performing security verification". The block was
+        triggered by exhausting the anonymous quota with a burst of requests,
+        so the mitigation is a key, not patience.
+
+        `JINA_API_KEY` is therefore a hard requirement for LinkedIn
+        ingestion. When it is unset the strategy records `skipped` with the
+        reason, and the chain continues — it is never silently dropped.
 
         **Instagram — not usable.** The same route returns the Instagram
         login wall, because Instagram requires an authenticated session even
-        for public profiles. It remains in the chain as a last resort in case
-        a profile is reachable without a login prompt.
-
-        The markdown is truncated to a bounded character budget before being
-        passed to the analysis stage.
-
-        **Third strategy — JSON response mode.** The same reader also supports
-        a structured output mode (request it with `Accept: application/json`)
-        that returns extracted content as JSON rather than raw markdown. This
-        is Strategy 3 for LinkedIn: it is a different code path, reached only
-        when the markdown renders but parses into too little usable content.
+        for public profiles. It remains last in the Instagram chain as a
+        fallback in case a profile is reachable without a login prompt.
       operationId: fetchViaReader
       parameters:
         - name: target_url
           in: path
           required: true
           schema: { type: string, example: 'https://www.linkedin.com/in/williamhgates/' }
-        - name: mode
-          in: query
-          required: false
-          schema: { type: string, enum: [markdown, json], default: markdown }
-          description: 'markdown maps to strategy `li_jina_reader`/`ig_jina_reader`; json maps to `li_jina_reader_json`'
+        - name: Authorization
+          in: header
+          required: true
+          schema: { type: string, example: 'Bearer jina_...' }
+          description: Omit to receive the Cloudflare challenge instead
       responses:
         '200':
           description: Rendered markdown of the public page
           content:
             text/markdown:
               schema: { type: string }
+        '401':
+          description: Search endpoint requires a key; anonymous quota exhausted
+        '403':
+          description: Cloudflare interstitial — anonymous quota exhausted
         '404':
           description: Target unreachable or requires authentication
         '429':
@@ -363,6 +424,14 @@ paths:
 
 components:
   securitySchemes:
+    JinaApiKey:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: >
+        Supplied as `Bearer $JINA_API_KEY`. Required for LinkedIn ingestion —
+        anonymous reader access is throttled by a Cloudflare interstitial
+        that does not clear. Never logged, never committed.
     GeminiApiKey:
       type: apiKey
       in: header

@@ -28,11 +28,15 @@
 
 ### 1.1 Overview
 
-This story implements stage one of a four-stage pipeline. Nothing else in the product works until a person has a source record, so this stage is designed around a single uncomfortable truth discovered during probing: **both target platforms actively resist automated reads.** Instagram serves a login wall to unauthenticated clients, returning HTTP 200 with a JavaScript shell containing no profile data at all. LinkedIn serves HTTP 999 — a non-standard status code it uses in place of 403 specifically so that automated clients cannot distinguish a ban from a permission error. There is no single request that works for both platforms, and pretending otherwise would produce a system that looks complete while silently ingesting nothing.
+This story implements stage one of a four-stage pipeline. Nothing else in the product works until a person has a source record, so this stage is designed around a single uncomfortable truth discovered during probing: **both target platforms actively resist automated reads, and the correct way in is not the one that looks obvious.**
 
-The design response is an ordered **Strategy chain** executed per source. For LinkedIn the chain is `li_direct` → `li_jina_reader` → `li_jina_reader_json`. For Instagram it is `ig_web_profile_info` → `ig_embed` → `ig_jina_reader`, where the first strategy is Instagram's own undocumented web-profile endpoint — the only route that returns real profile JSON without authentication. Each strategy attempt is logged with its HTTP status, outcome classification, and duration. The first strategy to yield a usable payload wins and is recorded as `winning_strategy` on the source record.
+Instagram serves a login wall to unauthenticated HTTP clients — HTTP 200 with a 640KB JavaScript shell containing zero occurrences of `og:description` and zero occurrences of `"biography"`. LinkedIn serves HTTP 999, a non-standard status code used in place of 403 specifically so automated clients cannot distinguish a ban from a permission error. The instinctive response is to find a proxy or a headless endpoint, and probing found one: a **headless browser render returns the full Instagram profile** — real biography, real follower counts, real OG tags — where plain HTTP returns nothing at all. So the primary Instagram strategy is a rendered page, not an API call.
 
-Crucially, failure is a first-class outcome, not an exception. Each source resolves independently and concurrently, so a person whose LinkedIn is blocked but whose Instagram succeeds is marked `partial`, not `failed`. The platform never fabricates profile content, never silently substitutes placeholder text, and never reports a person as ingested on the strength of one source when two were requested. This honesty is the product's credibility: a reviewer can see exactly which strategy won for which source, and the ingest-run audit log lets them read the whole attempt sequence.
+LinkedIn proved harder. Direct fetch returns 999. A headless browser returns an authwall (`Sign Up | LinkedIn`) rather than the profile, because LinkedIn gates profiles behind login even for a real browser. The one route that worked was a server-side render-to-markdown reader, and it worked only until the anonymous quota was exhausted, after which it sits behind a Cloudflare challenge indefinitely. **LinkedIn therefore requires a reader API key.** Without one, LinkedIn ingestion is expected to fail on most networks, and the system is designed to say so precisely rather than to paper over it.
+
+The design response is an ordered **Strategy chain** executed per source. For Instagram: `ig_browser_render` → `ig_web_profile_info` → `ig_embed` → `ig_jina_reader`. For LinkedIn: `li_jina_reader` → `li_direct` → `li_browser_render`. Each attempt is logged with its HTTP status, outcome classification, and duration. The first strategy to yield a usable payload wins and is recorded as `winning_strategy` on the source record.
+
+Crucially, failure is a first-class outcome, not an exception. Each source resolves independently and concurrently, so a person whose LinkedIn is blocked but whose Instagram succeeded is marked `partial`, not `failed`. The platform never fabricates profile content, never silently substitutes placeholder text, and never reports a person as ingested on the strength of one source when two were requested. This honesty is the product's credibility: a reviewer can see exactly which strategy won for which source, and the ingest-run audit log lets them read the whole attempt sequence.
 
 ### 1.2 Requirement Details
 
@@ -81,33 +85,43 @@ For a given `source`, attempt each registered strategy **in declared order** and
 **LinkedIn** — three strategies, satisfying REQ-2.1's minimum of three ordered attempts per source:
 | Order | Strategy id | Mechanism | Verified behaviour |
 |---|---|---|---|
-| 1 | `li_direct` | `httpx` GET on the profile URL with a realistic browser UA | **HTTP 999** — explicit bot block, not retryable |
-| 2 | `li_jina_reader` | GET `https://r.jina.ai/{target}` with default markdown output | **200, ~77KB markdown** — headline, About, experience, education, skills |
-| 3 | `li_jina_reader_json` | Same reader, but requesting its JSON response mode (`Accept: application/json`) for a structured extract rather than raw markdown | Not separately probed; reachable in principle, used when step 2 returns a payload too thin to parse |
+| 1 | `li_jina_reader` | GET `https://r.jina.ai/{target}` with `Authorization: Bearer $JINA_API_KEY` | **200, ~77KB markdown** with a key (headline, About, experience, education, skills). **403 Cloudflare challenge without a key**, and it does not clear with retries or a real browser |
+| 2 | `li_direct` | `httpx` GET on the profile URL with a realistic browser UA | **HTTP 999** — explicit bot block, not retryable |
+| 3 | `li_browser_render` | Headless browser render of the profile URL | **200 but `Sign Up \| LinkedIn`** — authwall; the profile is gated behind login even for a real browser |
 
-`li_direct` is retained despite being blocked because the block is IP- and header-dependent and does succeed from some networks; a strategy that is skipped without being tried is an untested assumption. `li_jina_reader_json` is retained as a genuinely different code path — structured output rather than markdown to parse — so it recovers content when the markdown renders but parses poorly.
+`li_jina_reader` is ordered first because it is the only strategy that has ever returned real LinkedIn content. `li_direct` is retained because the block is IP- and header-dependent and does succeed from some networks — a strategy skipped without being tried is an untested assumption. `li_browser_render` is retained last because it is the most expensive strategy and the least likely to succeed, but it costs one page load and occasionally the profile is visible to a fresh session.
 
-**Instagram** — three strategies:
+**`li_jina_reader` requires `JINA_API_KEY`.** This is a hard dependency for LinkedIn ingestion, not an optimisation. Without it, every LinkedIn source resolves to `blocked` on a throttled network, and the platform correctly reports `partial` for every person. The chain is not skipped when the key is absent — it runs, fails, and records why.
+
+**Instagram** — four strategies:
 | Order | Strategy id | Mechanism | Verified behaviour |
 |---|---|---|---|
-| 1 | `ig_web_profile_info` | GET `.../api/v1/users/web_profile_info/?username=` with `x-ig-app-id: 936619743392459` | **200, full JSON** — name, bio, counts, category, external URL. **429 from a single IP** |
-| 2 | `ig_embed` | GET the `/embed/` route and parse OG meta tags | 200 but returns the same shell — partial |
-| 3 | `ig_jina_reader` | GET via reader | Returns the **login wall** — last resort only |
+| 1 | `ig_browser_render` | Headless browser render of `instagram.com/{handle}/`, then read `"biography"`, `"full_name"` and OG tags from the hydrated DOM | **200, full data.** Confirmed on 3 accounts: `@nasa` → bio "Making the seemingly impossible, possible.", 104M followers |
+| 2 | `ig_web_profile_info` | GET `.../api/v1/users/web_profile_info/?username=` with `x-ig-app-id: 936619743392459` | 200 with full JSON when not throttled; **429 sustained from a single IP even at 1 request per 20s** |
+| 3 | `ig_embed` | GET the `/embed/` route and parse OG meta tags | 200, returns the same shell — no data |
+| 4 | `ig_jina_reader` | GET via reader | Returns the **login wall** — last resort only |
+
+`ig_browser_render` is ordered first because it is the **only strategy verified to work** on the current network. It is ordered ahead of the cheaper JSON API despite costing 6–8s per page because a verified strategy that works is worth more than a fast one that returns 429. `ig_web_profile_info` stays second: it is roughly 100× cheaper and is the right primary on a network that has not been throttled, so an environment variable can reorder the chain without a code change.
+
+##### The rendered-page strategy in detail:
+Playwright drives the Chromium engine already installed on the host (Edge on Windows), so no browser download is required. One browser instance is launched per process and reused; each fetch opens a page in a shared context, navigates, waits for the profile hydration selector, reads the payload, and closes the page. Data is extracted from the embedded JSON island rather than from CSS selectors, so it survives most layout changes.
 
 ##### Success Classification:
 A strategy attempt resolves to exactly one outcome, and the classifier determines success **by content, not by status code** — a 200 carrying a login wall is a failure:
 
 | Outcome | Trigger | Retryable |
 |---|---|---|
-| `success` | LinkedIn: ≥ 2000 chars of markdown containing ≥ 1 expected section heading. Instagram: JSON with `data.user.username` matching the requested handle | No |
-| `blocked` | LinkedIn HTTP 999, or any 401/403, or content matching `LOGIN_WALL_PATTERNS` | No — escalate immediately |
+| `success` | LinkedIn: ≥ 2000 chars of markdown containing ≥ 1 expected section heading. Instagram: a parsed `"biography"` or `"full_name"` whose username matches the requested handle | No |
+| `blocked` | LinkedIn HTTP 999, or any 401/403, a Cloudflare challenge body, an authwall title, or content matching `LOGIN_WALL_PATTERNS` | No — escalate immediately |
 | `rate_limited` | HTTP 429 | Yes — tenacity exponential backoff, 3 attempts |
-| `timeout` | httpx timeout after 15s | Yes — 1 retry |
-| `error` | 5xx, DNS failure, connection refused, malformed payload | 1 retry |
+| `timeout` | Request timeout after 15s (30s for a render) | Yes — 1 retry |
+| `error` | 5xx, DNS failure, connection refused, malformed payload, Playwright launch failure | 1 retry |
 
 ##### Acceptance Criteria:
-- **WHEN** the LinkedIn chain runs against a public profile **THEN** `li_direct` is attempted first, its HTTP 999 outcome is logged, `li_jina_reader` runs second, and on success the `source_profiles` row records `winning_strategy = 'li_jina_reader'`.
-- **WHEN** a strategy returns HTTP 200 whose body matches `LOGIN_WALL_PATTERNS` **THEN** the outcome is recorded as `blocked`, not `success`, and the chain advances.
+- **WHEN** the Instagram chain runs against a public account **THEN** `ig_browser_render` is attempted first and, on a hydrated profile, the `source_profiles` row records `winning_strategy = 'ig_browser_render'` with the biography and follower count.
+- **WHEN** a rendered Instagram page contains no `biography` and no `full_name` **THEN** the outcome is `blocked`, not `success`, and the chain advances.
+- **WHEN** the LinkedIn chain runs **THEN** `li_jina_reader` is attempted first and the attempt is skipped with a recorded reason if `JINA_API_KEY` is unset, without raising.
+- **WHEN** a strategy returns HTTP 200 whose body matches `LOGIN_WALL_PATTERNS` or contains a Cloudflare challenge **THEN** the outcome is recorded as `blocked`, not `success`, and the chain advances.
 - **WHEN** a strategy returns HTTP 429 **THEN** the system retries with exponential backoff and jitter at most 3 times before recording `rate_limited`.
 - **WHEN** a strategy returns HTTP 999 **THEN** the system does not retry it and advances immediately to the next strategy.
 - **WHEN** every strategy in a chain fails **THEN** the `source_profiles` row is still written with `success = false` and a `failure_reason` naming the last strategy and its outcome.
@@ -119,13 +133,15 @@ Resolve `linkedin` and `instagram` concurrently within one person using `asyncio
 
 ##### Concurrency Budget:
 - Per person: at most 2 concurrent chains
-- Across people: a global `asyncio.Semaphore(4)` limits concurrent **outbound** requests, because Instagram's 429 threshold is the binding constraint in the system, not our own throughput
-- Per request: 15s timeout, 20s total per source chain
+- Across people: a global `asyncio.Semaphore(4)` on plain `httpx` strategies, and a **separate** `asyncio.Semaphore(2)` on browser-render strategies, because a browser page costs ~1000× the memory of an HTTP request
+- The browser is a **single shared instance** with a bounded page pool, not one browser per request
+- Per request: 15s timeout for `httpx`, 30s for a render, 45s total per source chain
 
 ##### Acceptance Criteria:
 - **WHEN** the LinkedIn chain raises an unexpected exception **THEN** the Instagram chain still completes and its result is persisted.
-- **WHEN** a person is ingested **THEN** at most 2 source chains run concurrently for that person and no more than 4 outbound requests are in flight system-wide.
-- **WHEN** a single source chain exceeds 20 seconds total **THEN** it is abandoned, recorded as `timeout`, and the other source's result is unaffected.
+- **WHEN** a person is ingested **THEN** at most 2 source chains run concurrently for that person, no more than 4 plain HTTP requests are in flight system-wide, and no more than 2 browser pages are open.
+- **WHEN** a single source chain exceeds 45 seconds total **THEN** it is abandoned, recorded as `timeout`, and the other source's result is unaffected.
+- **WHEN** the browser fails to launch **THEN** render strategies record `error` with the Playwright launch message and the remaining strategies still run.
 
 ##### 1.2.4 ING-104: Strategy Audit Logging and Provenance Recording
 
@@ -241,11 +257,13 @@ Ingest the whole roster in one tracked operation so a reviewer sees aggregate ou
 
 - `httpx` — async HTTP client with per-request timeout control
 - `tenacity` — retry with exponential backoff and jitter for `rate_limited` and `error` outcomes
+- `playwright` — drives the host's installed Chromium (Edge on Windows, system Chrome elsewhere); no browser download required
 - `pydantic` v2 — `PersonCreate`, `SourceProfilePayload` validation models
 - SQLAlchemy 2.x async + `asyncpg` — persistence
 - Alembic — schema migrations
 - `structlog` — structured attempt logging
-- Outbound: `r.jina.ai` reader, Instagram `web_profile_info` API, LinkedIn public profile
+- Outbound: Instagram (render, web-profile API, embed), LinkedIn (reader, direct, render), Jina reader
+- Secrets: `JINA_API_KEY` (required for LinkedIn ingestion), `LLM_API_KEY` (not used by this stage)
 
 ---
 
@@ -281,14 +299,14 @@ The grader will run this against real profiles on an unknown IP with unknown rep
 ##### 2.1.2.2 NFR-102: Bounded Outbound Concurrency
 
 ##### Description:
-Global `asyncio.Semaphore(4)` on outbound requests, 15s per-request timeout, 20s per-source-chain budget, 30s per-person ceiling.
+Global `asyncio.Semaphore(4)` on plain `httpx` strategies, `asyncio.Semaphore(2)` on browser-render strategies, 15s per-request timeout (30s for a render), 45s per-source-chain budget, 60s per-person ceiling.
 
 ##### Rationale:
-Instagram's rate limiter is the binding constraint in the system. Bursting 25 concurrent requests converts a mostly-successful run into a mostly-429 run. Four concurrent requests completes a 25-person ingest in roughly 60–90 seconds without triggering sustained throttling.
+Instagram's rate limiter and LinkedIn's bot block are the binding constraints in the system. Bursting requests converts a mostly-successful run into a mostly-blocked one. Browser renders get their own, tighter semaphore because a page costs roughly 1000× the memory of an HTTP request — sharing the same budget would let four simultaneous page renders exhaust the process.
 
 ##### Acceptance Criteria:
-- **WHEN** 25 people are ingested concurrently **THEN** no more than 4 outbound requests are in flight at any instant.
-- **WHEN** a single request hangs **THEN** it is abandoned at 15s and the chain advances to the next strategy.
+- **WHEN** 25 people are ingested concurrently **THEN** no more than 4 plain HTTP requests and no more than 2 browser pages are in flight at any instant.
+- **WHEN** a single request hangs **THEN** it is abandoned at 15s, or 30s for a render, and the chain advances to the next strategy.
 
 ##### 2.1.2.3 NFR-103: Bounded Memory and Storage per Fetch
 
@@ -315,11 +333,11 @@ Hard ceilings: 2 MB per response body, 50 KB stored `raw_payload`, 8 000 charact
 |---|---|---|
 | Per-source fetch | 1–4s typical | Reader render dominates |
 | Per-person ingest | 3–15s | Two concurrent chains |
-| 25-person bulk ingest | 60–120s | Semaphore-bound at 4 |
+| 25-person bulk ingest | 90–180s | Render-bound: ~7s per Instagram page at 2 concurrent |
 | Character classification (content-based, 200–1000 chars) | < 1ms | Regex, no model call |
 | `GET /v1/people` for 25 people | < 50ms | Single query, no N+1 |
 
-The 1 MB+ Instagram shell and 77 KB LinkedIn markdown are both processed in-process without a headless browser, so there is no Chromium dependency in the deployment image.
+One strategy does require a browser: `ig_browser_render` is the only way to read an Instagram profile on a throttled network, so Playwright drives the Chromium engine already present on the host. That adds a shared browser process and a page pool, plus a ~1000× per-request memory cost versus plain HTTP, but it is the difference between reading Instagram and reading nothing. `li_browser_render` also exists as a last-resort LinkedIn attempt and costs the same.
 
 #### 2.2.3 Availability and Reliability
 
@@ -352,8 +370,8 @@ Zero infrastructure cost — all external calls are to free tiers of public endp
 - LinkedIn URL canonicalisation, validation, and uniqueness enforcement
 - Instagram handle normalisation from all four input forms
 - Ordered strategy chain per source, with content-based success classification
-- LinkedIn chain: `li_direct` → `li_jina_reader` → `li_jina_reader_json`
-- Instagram chain: `ig_web_profile_info` → `ig_embed` → `ig_jina_reader`
+- LinkedIn chain: `li_jina_reader` → `li_direct` → `li_browser_render`
+- Instagram chain: `ig_browser_render` → `ig_web_profile_info` → `ig_embed` → `ig_jina_reader`
 - Concurrent independent resolution of the two sources
 - Per-attempt audit logging and per-source provenance recording
 - `ingest_state` derivation across all four success combinations
@@ -391,6 +409,6 @@ The ingestion state machine is rendered on the roster screen as a three-state ba
 
 #### 4.3 Infrastructure Design Diagram
 
-The FastAPI process holds the strategy chains, the shared `httpx.AsyncClient`, and the `asyncio.Semaphore(4)`. Outbound calls reach the Instagram web-profile API, the Instagram public and embed routes, LinkedIn public profiles, and the Jina reader. PostgreSQL 18 on `127.0.0.1:5432` receives every result. No broker, no worker, no headless browser.
+The FastAPI process holds the strategy chains, the shared `httpx.AsyncClient`, the `asyncio.Semaphore(4)`, and a single shared Playwright browser with a bounded page pool and its own `asyncio.Semaphore(2)`. Outbound calls reach Instagram (render, web-profile API, embed), LinkedIn (reader, direct, render), and the Jina reader. PostgreSQL 18 on `127.0.0.1:5432` receives every result. No broker and no worker; the browser is a process-level resource owned by the app, not a per-request one.
 
 **Diagram Location:** `api/external-api.yaml` (Instagram, LinkedIn, and Jina Reader path definitions)

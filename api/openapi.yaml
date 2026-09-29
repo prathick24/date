@@ -888,7 +888,7 @@ components:
         winning_strategy:
           type: string
           nullable: true
-          enum: [li_direct, li_jina_reader, li_jina_reader_json, ig_web_profile_info, ig_embed, ig_jina_reader, null]
+          enum: [li_jina_reader, li_direct, li_browser_render, ig_browser_render, ig_web_profile_info, ig_embed, ig_jina_reader, null]
         http_status: { type: integer, nullable: true, example: 200 }
         success: { type: boolean, example: true }
         failure_reason: { type: string, nullable: true }
