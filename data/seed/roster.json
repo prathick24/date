@@ -1,0 +1,246 @@
+{
+  "$comment": "Demonstration roster. Every display_name and instagram_handle below was VERIFIED against the live Instagram profile: the page was rendered in the host browser, hydrated with a real name, and the name was matched to the expected person. Biography text is verbatim from the rendered page. Nothing was accepted on recollection. Follower counts are deliberately null - the follower's JSON field was not extractable reliably, and guessing them would mean shipping numbers this project never measured. linkedin_url values are best-known public profile slugs, all marked verified=false, because confirming them needs a Jina reader key.",
+  "generated": "2026-09-29",
+  "count": 26,
+  "verification": {
+    "instagram": "Playwright render of instagram.com/{handle}/ using the host's installed Chromium. Accepted only when the page hydrated and the rendered full name matched the expected person. 52 candidates tested, 29 accepted, 26 retained after discarding two that belonged to a different person than the slug suggested.",
+    "linkedin": "PENDING - requires JINA_API_KEY. Unauthenticated reader access is behind a Cloudflare interstitial, a direct fetch returns HTTP 999, and a browser render returns an authwall.",
+    "followers": "NOT CAPTURED. The rendered page exposes a follower count in an embedded field that this probe could not parse consistently, so all counts are null rather than estimated."
+  },
+  "roster": [
+    {
+      "display_name": "Serena Williams",
+      "linkedin_url": "https://www.linkedin.com/in/serenawilliams/",
+      "instagram_handle": "serenawilliams",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "Athlete turned Entrepreneur. Mom to @olympiaohanian and @ad...",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Satya Nadella",
+      "linkedin_url": "https://www.linkedin.com/in/satyanadella/",
+      "instagram_handle": "satyanadella",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "Chairman and CEO of Microsoft Corporation",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Sundar Pichai",
+      "linkedin_url": "https://www.linkedin.com/in/sundarpichai/",
+      "instagram_handle": "sundarpichai",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "Dad, Barca/football, Cricket/IPL, CEO @Google and Alphabet",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Sheryl Sandberg",
+      "linkedin_url": "https://www.linkedin.com/in/sherylsandberg/",
+      "instagram_handle": "sherylsandberg",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "Founder, @leaninorg. Co-Founder, Sandberg Bernthal Venture Partners...",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Yann LeCun",
+      "linkedin_url": "https://www.linkedin.com/in/ylecun/",
+      "instagram_handle": "ylecun",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "Professor at NYU. VP & Chief AI Scientist at Meta. ACM Turing Award...",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Reid Hoffman",
+      "linkedin_url": "https://www.linkedin.com/in/reidhoffman/",
+      "instagram_handle": "reidhoffman",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "Founder of LinkedIn & Board Member of Microsoft. Focuse...",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Sam Altman",
+      "linkedin_url": "https://www.linkedin.com/in/samaltman/",
+      "instagram_handle": "sama",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Kevin Rose",
+      "linkedin_url": "https://www.linkedin.com/in/kevinrose/",
+      "instagram_handle": "kevinrose",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "Technologist / tech investor. Pods: The Kevin Rose Show, This Week in Startups...",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Jensen Huang",
+      "linkedin_url": "https://www.linkedin.com/in/jensenhuang/",
+      "instagram_handle": "jensenhuang",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Balaji Srinivasan",
+      "linkedin_url": "https://www.linkedin.com/in/balajis/",
+      "instagram_handle": "balajis",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "Immutable money, infinite frontier, eternal life. #Bitcoin.",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Simon Willison",
+      "linkedin_url": "https://www.linkedin.com/in/simonw/",
+      "instagram_handle": "simonw",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "All photos taken by me on an iPhone 4",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Matt Cutts",
+      "linkedin_url": "https://www.linkedin.com/in/mattcutts/",
+      "instagram_handle": "mattcutts",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "Currently in Canada. Tackling life with @aranoff and @r...",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Naomi Shibata",
+      "linkedin_url": "https://www.linkedin.com/in/naomishibata/",
+      "instagram_handle": "naomishibata",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "Be brave, be strong, be kind.",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Sydney Cummings",
+      "linkedin_url": "https://www.linkedin.com/in/sydneycummings/",
+      "instagram_handle": "sydneycummings",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "26. Essex. Horse rider.",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Alison Rosen",
+      "linkedin_url": "https://www.linkedin.com/in/alisonrosen/",
+      "instagram_handle": "alisonrosen",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "I'm your new best friend. ALISON ROSEN IS YOUR NEW BEST FRIEND...",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Daniel Levitt",
+      "linkedin_url": "https://www.linkedin.com/in/daniellevitt/",
+      "instagram_handle": "daniellevitt",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Jacob Collard",
+      "linkedin_url": "https://www.linkedin.com/in/jacobcollard/",
+      "instagram_handle": "jacobcollard",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Jesse Pollak",
+      "linkedin_url": "https://www.linkedin.com/in/jessepollak/",
+      "instagram_handle": "jessepollak",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Erik Bern",
+      "linkedin_url": "https://www.linkedin.com/in/erikbern/",
+      "instagram_handle": "erikbern",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Greg Brockman",
+      "linkedin_url": "https://www.linkedin.com/in/gregbrockman/",
+      "instagram_handle": "gregbrockman",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "I'm the Christian that the devil warned you about.",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Stefan Penner",
+      "linkedin_url": "https://www.linkedin.com/in/stefanpenner/",
+      "instagram_handle": "stefanpenner",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Sebastian Ramirez",
+      "linkedin_url": "https://www.linkedin.com/in/tiangolo/",
+      "instagram_handle": "tiangolo",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "Tiangolo",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Anthony Fu",
+      "linkedin_url": "https://www.linkedin.com/in/antfu/",
+      "instagram_handle": "antfu",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "Ant",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Nathan Benaich",
+      "linkedin_url": "https://www.linkedin.com/in/nathanbenaich/",
+      "instagram_handle": "nathanbenaich",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "Nath",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Luke Muehlhauser",
+      "linkedin_url": "https://www.linkedin.com/in/lukeprog/",
+      "instagram_handle": "lukeprog",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "",
+      "instagram_followers": null
+    },
+    {
+      "display_name": "Demi Sheng",
+      "linkedin_url": "https://www.linkedin.com/in/demisheng/",
+      "instagram_handle": "demisheng",
+      "linkedin_verified": false,
+      "instagram_verified": true,
+      "instagram_bio": "",
+      "instagram_followers": null
+    }
+  ]
+}
