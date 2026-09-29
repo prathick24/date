@@ -1,0 +1,70 @@
+%% ST-102 Analysis — LLM path, Taxonomy fallback, evidence validation
+%% Design rule: the stage ALWAYS returns traits. LLM is an enhancement, not a dependency.
+flowchart TD
+    START([POST /v1/people/id/analyze]) --> CHECK{ingest_state<br/>in ingested/partial?}
+    CHECK -->|pending or failed| E409([409 NOT_INGESTED])
+    CHECK -->|Yes| LOAD[Load source_profiles rows]
+
+    LOAD --> PARTIAL{ingest_state<br/>== partial?}
+    PARTIAL -->|Yes| FLAG[Force low_confidence=true on<br/>all traits; disallow cross_source]
+    PARTIAL -->|No| ENGINE
+    FLAG --> ENGINE
+
+    ENGINE{LLM key present<br/>and reachable?}
+
+    %% ── LLM PATH ──
+    ENGINE -->|Yes| CHAIN[Resolve model chain<br/>3.8-flash 503 → 3.1-flash-lite OK<br/>→ flash-latest 503]
+    CHAIN --> CALL[generateContent<br/>responseMimeType=application/json<br/>responseSchema=TraitExtraction<br/>thinkingBudget=0]
+    CALL --> VALID{Pydantic<br/>valid?}
+    VALID -->|No| RETRY[Retry once with<br/>validation error as feedback]
+    RETRY --> VALID
+    VALID -->|Still invalid| CHAIN
+    VALID -->|Yes| LLMTRAITS[Traits from model]
+    CHAIN -->|All models failed| TAX
+
+    %% ── TAXONOMY PATH ──
+    ENGINE -->|No| TAX[Taxonomy Engine<br/>keyword dictionaries + section-aware<br/>extraction + pattern rules<br/>zero network, zero key]
+    TAX --> TAXTRAITS[Traits from regex]
+
+    %% ── SHARED VALIDATION ──
+    LLMTRAITS --> PROV
+    TAXTRAITS --> PROV
+
+    PROV[Evidence validation — the fabrication guard]
+    PROV --> P1[Normalise evidence_quote]
+    P1 --> P2{QQuote found verbatim<br/>in sanitised source?}
+    P2 -->|Yes| P3[provenance = that source<br/>confidence unchanged]
+    P2 -->|Both sources| P4[provenance = cross_source<br/>confidence +0.15]
+    P2 -->|No| P5[provenance = inferred<br/>confidence x 0.5<br/>evidence_quote = empty]
+    P3 --> P6
+    P4 --> P6
+    P5 --> P6{confidence < 0.4?}
+    P6 -->|Yes| P7[DROP the trait]
+    P6 -->|No| P8[Persist trait]
+    P7 --> P8
+
+    P8 --> DEDUP[Deduplicate by label<br/>case-insensitive, keep highest confidence]
+    DEDUP --> LOW{Trait count < 5?}
+    LOW -->|Yes| LC[low_confidence = true]
+    LOW -->|No| PERS
+    LC --> PERS
+
+    PERS[(Upsert profile_traits +<br/>agent_personas in one transaction)]
+    PERS --> USAGE[(Append model_usage row<br/>append-only, incl. failed calls)]
+    PERS --> PERSONA
+
+    PERSONA[Agent persona generation]
+    PERSONA --> PN[agent_name — unique,<br/>deterministic, suffix on collision]
+    PERSONA --> PT[tone — derived from person_id<br/>warm/dry/playful/direct/poetic]
+    PERSONA --> PS[summary — one grounded sentence]
+    PERSONA --> PG[guardrails — 5 hard limits,<br/>PERSISTED not improvised]
+
+    PG --> RESP([200 OK<br/>generated_by: llm or taxonomy<br/>total_traits, low_confidence,<br/>counts_by_type])
+
+    style TAX fill:#fff3cd
+    style P5 fill:#fff3cd
+    style P7 fill:#ffd6d6
+    style P8 fill:#d4edda
+    style P4 fill:#d4edda
+    style RESP fill:#d4edda
+    style PG fill:#cce5ff

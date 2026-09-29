@@ -1,0 +1,61 @@
+%% ST-101 Ingestion — strategy chain resolution
+%% For each of the two sources, walk the ordered chain.
+%% Outcome is decided by CONTENT, not by status code.
+flowchart TD
+    START([POST /v1/people/id/ingest]) --> GUARD{Already ingested<br/>and force=false?}
+    GUARD -->|Yes| EARLY[Return 200 immediately<br/>no outbound request]
+    GUARD -->|No| SEM
+
+    SEM[[asyncio.Semaphore 4<br/>max 4 outbound in flight]] --> CHAIN
+
+    subgraph LINKEDIN["Source: linkedin — 3 strategies"]
+        CHAIN --> L1{li_direct}
+        L1 -->|HTTP 999 bot block| L2{li_jina_reader<br/>markdown mode}
+        L1 -->|200 with profile<br/>headings| LOK[success]
+        L2 -->|200 with 2k+ chars<br/>and a section heading| LOK
+        L2 -->|too thin to parse<br/>or 404| L3{li_jina_reader_json<br/>Accept: application/json}
+        L3 -->|200 with structured content| LOK
+        L3 -->|404 / login wall| LFAIL[failure: blocked]
+    end
+
+    subgraph INSTAGRAM["Source: instagram"]
+        CHAIN --> I1{ig_web_profile_info<br/>x-ig-app-id header}
+        I1 -->|200 with data.user.username<br/>matching handle| IOK[success]
+        I1 -->|429| RETRY[[tenacity backoff<br/>max 3 attempts]]
+        RETRY --> I1
+        RETRY -->|exhausted| I2{ig_embed}
+        I1 -->|404 private/absent| I2
+        I2 -->|200 with og:description| IOK
+        I2 -->|shell only| I3{ig_jina_reader}
+        I3 -->|200 with content| IOK
+        I3 -->|login wall| IFAIL[failure: blocked]
+    end
+
+    LOK --> SAN
+    IOK --> SAN
+
+    SAN[Sanitise: strip HTML, remove<br/>zero-width chars, neutralise<br/>instruction framing, truncate 8k] --> RECORD
+
+    LFAIL --> RECORD
+    IFAIL --> RECORD
+
+    RECORD[Write source_profiles row<br/>ALWAYS — even on failure.<br/>winning_strategy, http_status,<br/>duration, failure_reason]
+
+    RECORD --> DERIVE{Derive ingest_state}
+    DERIVE -->|both success| ING[ingested]
+    DERIVE -->|exactly one success| PART[partial]
+    DERIVE -->|both failed| FAILED[failed]
+
+    ING --> LOG[append to ingest_runs.strategy_log]
+    PART --> LOG
+    FAILED --> LOG
+
+    LOG --> RESP([200 OK with ingest_state<br/>NEVER a 5xx for upstream failure])
+
+    style LFAIL fill:#ffd6d6
+    style IFAIL fill:#ffd6d6
+    style PART fill:#fff3cd
+    style ING fill:#d4edda
+    style FAILED fill:#f8d7da
+    style SAN fill:#cce5ff
+    style RESP fill:#d4edda

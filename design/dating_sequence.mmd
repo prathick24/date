@@ -1,0 +1,83 @@
+%% ST-103 Dating — session lifecycle, citation gate, verdict gate
+%% Design rule: the deterministic gate runs AFTER generation and can only reduce optimism.
+flowchart TD
+    START([POST /v1/dates/run]) --> MODE{Pairing mode}
+
+    MODE -->|top_n default| TOP[Top N ranked pairs per person<br/>from ST-104 rank_for_a / rank_for_b]
+    MODE -->|all| ALL[Every unordered pair<br/>capped at 300]
+    MODE -->|explicit| EXP[Only the supplied pairs]
+
+    TOP --> DEDUP
+    ALL --> DEDUP
+    EXP --> DEDUP
+
+    DEDUP[Canonicalise to unordered set<br/>sort by person_id for determinism<br/>skip pairs already dated] --> COUNT{>= 2 analysed<br/>people?}
+    COUNT -->|No| E409([409 INSUFFICIENT_PEOPLE])
+    COUNT -->|Yes| SEM[[Semaphore 3<br/>max 3 generateContent in flight]]
+
+    SEM --> PERSIST[Insert date_sessions row<br/>status = running<br/>BEFORE generation]
+    PERSIST --> CTX
+
+    CTX[Build prompt context in code]
+    CTX --> C1[Both personas: name, tone,<br/>summary, GUARDRAILS verbatim]
+    CTX --> C2[Top 5 traits each, typed]
+    CTX --> C3[Shared traits — computed, not inferred]
+    CTX --> C4[Dealbreakers — explicit]
+    CTX --> C5[Instruct: diverge in register,<br/>do not mirror, do not agree on everything]
+
+    C5 --> LLMQ{LLM available?}
+
+    %% ── LLM PATH: ONE CALL FOR THE WHOLE SESSION ──
+    LLMQ -->|Yes| GEN[generateContent — single call<br/>returns ALL messages + verdict + plan<br/>temperature 0.9, thinkingBudget 0]
+    GEN --> SCHEMA{Schema valid?}
+    SCHEMA -->|No| RETRY[1 corrective retry<br/>validation error as feedback]
+    RETRY --> SCHEMA
+    SCHEMA -->|Yes| CITE
+    SCHEMA -->|No after retry| DET
+
+    %% ── CITATION GATE ──
+    CITE[Citation gate — verify every cited_trait]
+    CITE --> CG1{Each cited trait exists<br/>in a participant's traits?}
+    CG1 -->|No, strip it| CG2
+    CG1 -->|Yes| CG2{All messages still have<br/>>= 1 valid citation?}
+    CG2 -->|No| REGEN[Regenerate once<br/>then DET if it fails again]
+    REGEN --> GEN
+    CG2 -->|Yes| GATE
+
+    %% ── VERDICT GATE — can only DOWNGRADE ──
+    GATE{Deterministic verdict gate}
+    GATE -->|model said second_date<br/>AND shared traits < 2| DOWN1[Downgrade to friendzone]
+    GATE -->|model said second_date<br/>AND dealbreaker conflict| DOWN2[Downgrade to unmatched]
+    GATE -->|otherwise| KEEP[Keep the model's verdict]
+
+    DOWN1 --> PLAN
+    DOWN2 --> PLAN
+    KEEP --> PLAN
+
+    PLAN{verdict == second_date?}
+    PLAN -->|Yes| PVALID{Proposed plan uses a<br/>REAL shared hobby + location?}
+    PLAN -->|No| COMMIT
+    PVALID -->|No, too generic| REGEN
+    PVALID -->|Yes| COMMIT
+
+    %% ── DETERMINISTIC FALLBACK ──
+    LLMQ -->|No| DET[Deterministic Date Engine<br/>templates slot-filled from real traits<br/>zero network]
+    DET --> DGATE[Compute verdict in code<br/>same gate rules]
+    DGATE --> COMMIT
+
+    COMMIT[(Write date_sessions +<br/>date_messages in one transaction<br/>status = complete, engine recorded)]
+    COMMIT --> NEXT{More pairs?}
+
+    NEXT -->|Yes| SEM
+    NEXT -->|No| RESP([Return sessions_completed<br/>+ sessions_failed<br/>Partial results render immediately])
+
+    ERR[Exception during generation] --> FAILED[(status = failed<br/>+ error_log entry)]
+    FAILED --> NEXT
+
+    style GATE fill:#cce5ff
+    style DOWN1 fill:#fff3cd
+    style DOWN2 fill:#ffd6d6
+    style CITE fill:#cce5ff
+    style DET fill:#fff3cd
+    style COMMIT fill:#d4edda
+    style FAILED fill:#f8d7da

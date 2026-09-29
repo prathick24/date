@@ -32,3 +32,6 @@ Thumbs.db
 data/seed/*.snapshot.json
 *.db
 *.sqlite3
+
+# Kiro local template — required on disk for SD generation, never committed
+template.md

@@ -1,0 +1,177 @@
+erDiagram
+
+    %% ══════════════════════════════════════════════════
+    %% STAGE 1 — SOURCE INGESTION
+    %% people is the aggregate root. source_profiles stores the
+    %% raw fetched payload for EXACTLY two sources per person.
+    %% ══════════════════════════════════════════════════
+
+    people {
+        INT id PK
+        UUID uuid "NOT NULL UNIQUE"
+        VARCHAR_200 display_name "NOT NULL"
+        VARCHAR_500 linkedin_url "NOT NULL UNIQUE e.g. linkedin.com/in/slug"
+        VARCHAR_30 instagram_handle "NOT NULL UNIQUE canonical, no @ — e.g. nasa"
+        VARCHAR_50 city "NULL derived from LinkedIn or IG"
+        VARCHAR_20 ingest_state "NOT NULL DEFAULT pending CHECK (pending, partial, ingested, failed)"
+        INT profile_completeness "NOT NULL DEFAULT 0 0-100"
+        TIMESTAMP created_at "NULL DEFAULT NOW()"
+        TIMESTAMP updated_at "NULL DEFAULT NOW()"
+        BOOLEAN is_active "NULL DEFAULT TRUE"
+    }
+
+    source_profiles {
+        INT id PK
+        UUID uuid "NOT NULL UNIQUE"
+        INT person_id FK "NOT NULL refs people"
+        VARCHAR_20 source "NOT NULL CHECK (linkedin, instagram)"
+        VARCHAR_500 source_url "NOT NULL"
+        VARCHAR_40 winning_strategy "NULL CHECK (li_direct, li_jina_reader, li_jina_reader_json, ig_web_profile_info, ig_embed, ig_jina_reader)"
+        INT http_status "NULL e.g. 200, 999, 429"
+        TEXT raw_text "NULL normalised extracted text"
+        JSONB profile_fields "NULL structured fields name/bio/headline/followers"
+        BOOLEAN success "NOT NULL DEFAULT FALSE"
+        TEXT failure_reason "NULL"
+        INT fetch_duration_ms "NULL"
+        TIMESTAMP fetched_at "NULL DEFAULT NOW()"
+    }
+
+    ingest_runs {
+        INT id PK
+        UUID uuid "NOT NULL UNIQUE"
+        VARCHAR_20 trigger_type "NOT NULL CHECK (manual, seed, bulk)"
+        INT persons_total "NOT NULL DEFAULT 0"
+        INT persons_succeeded "NOT NULL DEFAULT 0"
+        INT persons_partial "NOT NULL DEFAULT 0"
+        INT persons_failed "NOT NULL DEFAULT 0"
+        JSONB strategy_log "NULL per-strategy attempt log"
+        TIMESTAMP started_at "NULL DEFAULT NOW()"
+        TIMESTAMP finished_at "NULL"
+    }
+
+    %% ══════════════════════════════════════════════════
+    %% STAGE 2 — AGENT PROFILE ANALYSIS
+    %% Each trait row carries its own provenance so the UI can
+    %% show WHERE a trait came from and HOW confident it is.
+    %% ══════════════════════════════════════════════════
+
+    profile_traits {
+        INT id PK
+        UUID uuid "NOT NULL UNIQUE"
+        INT person_id FK "NOT NULL refs people"
+        VARCHAR_30 trait_type "NOT NULL CHECK (hobby, interest, need, value, dealbreaker, dealmaker, conversation_opener, date_idea)"
+        VARCHAR_200 label "NOT NULL"
+        FLOAT confidence "NOT NULL DEFAULT 0.0 0.0-1.0"
+        VARCHAR_20 provenance_source "NULL CHECK (linkedin, instagram, cross_source, inferred)"
+        VARCHAR_40 provenance_strategy "NULL e.g. jina_reader, gemini-3.1-flash-lite, taxonomy"
+        TEXT evidence_quote "NULL verbatim text from the source"
+        BOOLEAN llm_generated "NOT NULL DEFAULT FALSE"
+        TIMESTAMP created_at "NULL DEFAULT NOW()"
+    }
+
+    agent_personas {
+        INT id PK
+        UUID uuid "NOT NULL UNIQUE"
+        INT person_id FK "NOT NULL UNIQUE refs people"
+        VARCHAR_50 agent_name "NOT NULL"
+        VARCHAR_20 tone "NOT NULL CHECK (warm, dry, playful, direct, poetic)"
+        TEXT guardrails "NULL what the agent must never claim"
+        TEXT summary "NOT NULL one-paragraph read of the person"
+        VARCHAR_30 generated_by "NOT NULL CHECK (llm, taxonomy)"
+        TIMESTAMP created_at "NULL DEFAULT NOW()"
+    }
+
+    %% ══════════════════════════════════════════════════
+    %% STAGE 4 — COMPATIBILITY RANKING
+    %% Deterministic scorer. One row per unordered pair.
+    %% ══════════════════════════════════════════════════
+
+    match_scores {
+        INT id PK
+        UUID uuid "NOT NULL UNIQUE"
+        INT person_a_id FK "NOT NULL refs people (always the lower id)"
+        INT person_b_id FK "NOT NULL refs people (always the higher id)"
+        FLOAT total_score "NOT NULL DEFAULT 0.0 0.0-100"
+        JSONB dimension_scores "NULL 8 named dimensions with weights"
+        JSONB shared_signals "NULL interests/hobbies/values in common"
+        JSONB conflict_signals "NULL dealbreaker violations"
+        TEXT rationale "NULL human-readable explanation"
+        INT rank_for_a "NULL 1-based rank of B within A's list"
+        INT rank_for_b "NULL 1-based rank of A within B's list"
+        BOOLEAN mutual_top_pick "NOT NULL DEFAULT FALSE"
+        TIMESTAMP created_at "NULL DEFAULT NOW()"
+    }
+
+    %% ══════════════════════════════════════════════════
+    %% STAGE 3 — AGENT DATING
+    %% date_sessions is one date between two agents.
+    %% date_messages is the multi-round transcript.
+    %% ══════════════════════════════════════════════════
+
+    date_sessions {
+        INT id PK
+        UUID uuid "NOT NULL UNIQUE"
+        INT initiator_person_id FK "NOT NULL refs people"
+        INT responder_person_id FK "NOT NULL refs people"
+        VARCHAR_20 status "NOT NULL DEFAULT pending CHECK (pending, running, complete, failed)"
+        INT rounds_completed "NOT NULL DEFAULT 0"
+        FLOAT predicted_score "NULL match_scores.total_score at run time"
+        VARCHAR_20 verdict "NULL CHECK (second_date, friendzone, unmatched)"
+        TEXT verdict_reasoning "NULL why the agents decided this"
+        TEXT proposed_date "NULL the concrete date plan"
+        VARCHAR_30 engine "NOT NULL CHECK (llm, deterministic)"
+        BOOLEAN llm_succeeded "NOT NULL DEFAULT FALSE"
+        TIMESTAMP started_at "NULL DEFAULT NOW()"
+        TIMESTAMP finished_at "NULL"
+    }
+
+    date_messages {
+        INT id PK
+        UUID uuid "NOT NULL UNIQUE"
+        INT session_id FK "NOT NULL refs date_sessions"
+        INT round_no "NOT NULL 1..5"
+        VARCHAR_20 speaker "NOT NULL CHECK (initiator, responder, system)"
+        INT speaker_person_id FK "NULL refs people"
+        TEXT content "NOT NULL"
+        JSONB cited_evidence "NULL the source trait this line was built from"
+        FLOAT round_chemistry "NULL 0.0-1.0 self-assessed warmth"
+        TIMESTAMP created_at "NULL DEFAULT NOW()"
+    }
+
+    %% ══════════════════════════════════════════════════
+    %% OPERATIONS
+    %% ══════════════════════════════════════════════════
+
+    model_usage {
+        INT id PK
+        UUID uuid "NOT NULL UNIQUE"
+        VARCHAR_50 purpose "NOT NULL CHECK (analysis, persona, dating, ranking)"
+        VARCHAR_100 model_id "NOT NULL"
+        INT input_tokens "NOT NULL DEFAULT 0"
+        INT output_tokens "NOT NULL DEFAULT 0"
+        INT latency_ms "NULL"
+        BOOLEAN fell_back "NOT NULL DEFAULT FALSE"
+        TIMESTAMP created_at "NULL DEFAULT NOW()"
+    }
+
+    error_log {
+        INT id PK
+        VARCHAR_200 file_name "NOT NULL"
+        VARCHAR_100 function_name "NOT NULL"
+        TEXT error "NOT NULL"
+        TIMESTAMP created_at "NULL DEFAULT NOW()"
+    }
+
+    %% ══════════════════════════════════════════════════
+    %% RELATIONSHIPS
+    %% ══════════════════════════════════════════════════
+
+    people ||--o{ source_profiles : "has exactly 2"
+    people ||--o{ profile_traits : "is described by"
+    people ||--|| agent_personas : "is represented by"
+    people ||--o{ match_scores : "ranked as a"
+    people ||--o{ match_scores : "ranked as b"
+    people ||--o{ date_sessions : "initiates"
+    people ||--o{ date_sessions : "responds to"
+    date_sessions ||--o{ date_messages : "contains"
+    people ||--o{ date_messages : "speaks as agent"

@@ -1,0 +1,73 @@
+%% ST-104 Ranking — deterministic pipeline
+%% No LLM. Pure set arithmetic over typed traits from ST-102.
+flowchart TD
+    START([POST /v1/rank]) --> N{analysable people<br/>>= 2?}
+    N -->|No| E409([409 INSUFFICIENT_PEOPLE])
+    N -->|Yes| CAP{<= 1000 people?}
+    CAP -->|No| E500([refuse — O(n^2) unbounded])
+    CAP -->|Yes| LOAD[(Single query: all profile_traits<br/>+ ingest_state + city)]
+
+    LOAD --> NORM[Normalisation]
+    NORM --> N1[lowercase, trim, collapse whitespace]
+    NORM --> N2[strip filler: 'a love of',<br/>'really into', 'passionate about']
+    NORM --> N3[singularise simple plurals]
+    NORM --> N4[map synonyms → canonical label<br/>trail runner|ultrarunning → trail running]
+    NORM --> N5[DROP: < 3 chars, or in STOP_LABELS<br/>stuff, things, misc, fun, life, friends]
+
+    N5 --> LOOP[For each unordered pair<br/>person_a_id < person_b_id enforced by CHECK]
+
+    subgraph DIMS["Eight weighted dimensions — total 100"]
+        LOOP --> D1[1. interest_overlap  25<br/>25 x Jaccard(interests)]
+        LOOP --> D2[2. hobby_complement   18<br/>18 x mean(overlap, complementarity)]
+        LOOP --> D3[3. value_alignment   15<br/>15 x Jaccard(values)]
+        LOOP --> D4[4. need_satisfaction 12<br/>A's needs found in B, both directions]
+        LOOP --> D5[5. energy_match      10<br/>activity-intensity pairing]
+        LOOP --> D6[6. life_stage         8<br/>career stage, relocation, family signals]
+        LOOP --> D7[7. geography          7<br/>same city 7 / country 4 / remote 2]
+    end
+
+    D1 --> SPARSE
+    D2 --> SPARSE
+    D3 --> SPARSE
+    D4 --> SPARSE
+    D5 --> SPARSE
+    D6 --> SPARSE
+    D7 --> SPARSE
+
+    SPARSE{Dimension skipped<br/>for a sparse set?}
+    SPARSE -->|Yes| REDIST[Redistribute that weight<br/>proportionally across the rest<br/>— total stays 100]
+    SPARSE -->|No| SUB[Sum sub-scores → raw_score]
+
+    REDIST --> SUB
+    LOOP --> PENALTY
+
+    PENALTY[Dealbreaker penalty]
+    PENALTY --> P1[For each dealbreaker of A,<br/>check B's traits + pattern rules]
+    P1 --> P2[Each violation: -15]
+    P2 --> P3[Capped at -30 total]
+    P3 --> P4[Floor total at 0,<br/>preserve raw_score for audit]
+
+    SUB --> P4
+    P4 --> SIGNALS[Extract shared_signals (cap 8)<br/>+ conflict_signals from<br/>the SAME arrays that scored]
+
+    SIGNALS --> RANK
+    RANK[Sort by total_score asc,<br/>tiebreak person_id — stable]
+    RANK --> DRANK[rank_for_a, rank_for_b<br/>dense ranking: 1, 2, 2, 3]
+    DRANK --> MUTUAL{mutual_top_pick =<br/>rank_a == 1 AND rank_b == 1?}
+
+    MUTUAL -->|Yes| TRUE[mutual_top_pick = true]
+    MUTUAL -->|No| FALSE[mutual_top_pick = false]
+
+    TRUE --> RATIONALE
+    FALSE --> RATIONALE
+    RATIONALE[Rationale — TEMPLATE in code,<br/>not LLM, so it cannot<br/>contradict the number]
+
+    RATIONALE --> UPSERT[(UPSERT match_scores<br/>keyed on ordered pair<br/>ONE transaction<br/>date_sessions untouched)]
+    UPSERT --> RESP([Return people_ranked,<br/>pairs_scored, mutual_top_picks,<br/>top_match])
+
+    style NORM fill:#cce5ff
+    style PENALTY fill:#ffd6d6
+    style RATIONALE fill:#cce5ff
+    style RANK fill:#d4edda
+    style UPSERT fill:#d4edda
+    style E500 fill:#f8d7da

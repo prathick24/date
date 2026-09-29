@@ -1,0 +1,1069 @@
+openapi: 3.0.3
+info:
+  title: Agentic Dating Site — Internal API Specification
+  description: >
+    OpenAPI specification for the Agentic Dating Site backend (FastAPI).
+    Every endpoint is unauthenticated: the platform is an open demonstration
+    and reviewers are expected to paste their own links without logging in.
+
+    Four pipeline stages are exposed:
+      ST-101 Ingestion  — POST /v1/people, POST /v1/people/{id}/ingest
+      ST-102 Analysis   — POST /v1/people/{id}/analyze, GET /v1/people/{id}/profile
+      ST-103 Dating     — POST /v1/dates/run, GET /v1/dates, GET /v1/dates/{id}
+      ST-104 Ranking    — POST /v1/rank, GET /v1/people/{id}/rankings, GET /v1/matches/matrix
+
+    All long-running stages return a job reference so the UI can poll progress.
+    All errors use a single envelope: {status, error_code, reason}.
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8000
+    description: Local development
+  - url: /
+    description: Deployed instance (same-origin, serves the built React SPA)
+
+tags:
+  - name: Health
+    description: Liveness and readiness probes
+  - name: People
+    description: Person registration and retrieval
+  - name: Ingestion
+    description: ST-101 multi-strategy source retrieval
+  - name: Analysis
+    description: ST-102 agent profile analysis
+  - name: Dating
+    description: ST-103 agent-to-agent dating engine
+  - name: Ranking
+    description: ST-104 compatibility ranking
+  - name: Seed
+    description: Demonstration dataset loading
+
+paths:
+
+  # ══════════════════════════════════════════════════
+  # HEALTH
+  # ══════════════════════════════════════════════════
+
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      description: Returns immediately if the process is up. Never touches the database.
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /ready:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      description: >
+        Verifies the database connection and the LLM/Taxonomy engine status.
+        Returns 503 when the database is unreachable so orchestrators can
+        hold traffic. LLM unavailability does NOT make the service unready —
+        the Taxonomy Engine keeps the pipeline operational.
+      operationId: readinessCheck
+      responses:
+        '200':
+          description: All hard dependencies ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
+        '503':
+          description: Database unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
+
+  # ══════════════════════════════════════════════════
+  # PEOPLE
+  # ══════════════════════════════════════════════════
+
+  /v1/people:
+    get:
+      tags: [People]
+      summary: List all registered people
+      description: >
+        Returns the full roster ordered by display_name. Each item includes
+        ingest_state and profile_completeness so the UI can show progress
+        badges without a second call.
+      operationId: listPeople
+      parameters:
+        - name: ingest_state
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [pending, partial, ingested, failed]
+          description: Filter by pipeline state
+      responses:
+        '200':
+          description: Roster returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: '' }
+                  total: { type: integer, example: 25 }
+                  people:
+                    type: array
+                    items: { $ref: '#/components/schemas/PersonSummary' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      tags: [People]
+      summary: Register a new person
+      description: >
+        Accepts exactly two official links — a LinkedIn profile URL and a
+        public Instagram profile. Registration performs NO network fetch;
+        it is a pure write. Ingestion is a separate explicit call.
+
+        Instagram input is normalised: `nasa`, `@nasa`, `instagram.com/nasa`
+        and the full URL all resolve to canonical handle `nasa`.
+      operationId: createPerson
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePersonRequest'
+            examples:
+              both_sources:
+                summary: Standard registration
+                value:
+                  display_name: "Ada Okonkwo"
+                  linkedin_url: "https://www.linkedin.com/in/adaokonkwo/"
+                  instagram_handle: "@ada.travels"
+      responses:
+        '201':
+          description: Person created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: '' }
+                  person: { $ref: '#/components/schemas/PersonDetail' }
+        '400':
+          $ref: '#/components/responses/InvalidInput'
+        '409':
+          description: A person with this LinkedIn URL or Instagram handle already exists
+          content:
+            application/json:
+              examples:
+                duplicate:
+                  value:
+                    status: error
+                    error_code: DUPLICATE_PERSON
+                    reason: "A person with linkedin_url 'https://www.linkedin.com/in/adaokonkwo/' already exists (person_id=7)."
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/people/{person_id}:
+    get:
+      tags: [People]
+      summary: Get one person with both source records
+      description: >
+        Returns the person plus their two `source_profiles` rows, including
+        the winning strategy and http status for each — this is what the
+        profile page uses to show provenance.
+      operationId: getPerson
+      parameters:
+        - $ref: '#/components/parameters/PersonId'
+      responses:
+        '200':
+          description: Person returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: '' }
+                  person: { $ref: '#/components/schemas/PersonDetail' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags: [People]
+      summary: Remove a person and all derived data
+      description: >
+        Cascades to source_profiles, profile_traits, agent_personas,
+        match_scores (both sides), date_sessions, and date_messages.
+      operationId: deletePerson
+      parameters:
+        - $ref: '#/components/parameters/PersonId'
+      responses:
+        '200':
+          description: Person deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Person 7 and all derived data deleted.' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ══════════════════════════════════════════════════
+  # ST-101 — INGESTION
+  # ══════════════════════════════════════════════════
+
+  /v1/people/{person_id}/ingest:
+    post:
+      tags: [Ingestion]
+      summary: Run the multi-strategy fetch for both sources
+      description: >
+        Attempts the ordered Strategy chain for `linkedin` and `instagram`
+        independently, in parallel. Sets `ingest_state` to `ingested`,
+        `partial`, or `failed` based on how many of the two Sources succeeded.
+
+        The request is synchronous per person (typically 3–15s) and returns
+        the resulting source records. Recoverable upstream blocks do NOT
+        produce a 5xx — they return 200 with `ingest_state: partial|failed`.
+      operationId: ingestPerson
+      parameters:
+        - $ref: '#/components/parameters/PersonId'
+        - name: force
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: Re-fetch even if a previous run succeeded
+      responses:
+        '200':
+          description: Ingestion attempt completed (state may be partial or failed)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: '' }
+                  person_id: { type: integer, example: 7 }
+                  ingest_state: { type: string, example: ingested }
+                  sources:
+                    type: array
+                    items: { $ref: '#/components/schemas/SourceProfile' }
+                  examples_note: { type: string, example: '' }
+              examples:
+                both_ok:
+                  summary: Both sources retrieved
+                  value:
+                    success: true
+                    message: ''
+                    person_id: 7
+                    ingest_state: ingested
+                    sources:
+                      - source: linkedin
+                        source_url: https://www.linkedin.com/in/adaokonkwo/
+                        winning_strategy: jina_reader
+                        http_status: 200
+                        success: true
+                        failure_reason: null
+                        fetch_duration_ms: 2140
+                      - source: instagram
+                        source_url: https://www.instagram.com/ada.travels/
+                        winning_strategy: ig_web_profile_info
+                        http_status: 200
+                        success: true
+                        failure_reason: null
+                        fetch_duration_ms: 860
+                linkedin_blocked:
+                  summary: Instagram succeeded, LinkedIn bot-blocked
+                  value:
+                    success: true
+                    message: ''
+                    person_id: 8
+                    ingest_state: partial
+                    sources:
+                      - source: linkedin
+                        source_url: https://www.linkedin.com/in/marcuslee/
+                        winning_strategy: null
+                        http_status: 999
+                        success: false
+                        failure_reason: "All linkedin strategies failed. Last: direct fetch returned HTTP 999 (bot-blocked)."
+                        fetch_duration_ms: 310
+                      - source: instagram
+                        source_url: https://www.instagram.com/marcuslee/
+                        winning_strategy: ig_web_profile_info
+                        http_status: 200
+                        success: true
+                        failure_reason: null
+                        fetch_duration_ms: 940
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/ingest-runs/{run_id}:
+    get:
+      tags: [Ingestion]
+      summary: Get an ingest run audit record
+      description: >
+        Returns aggregate counts and the full per-strategy attempt log
+        (`strategy_log`) for the run, so a reviewer can see exactly which
+        Strategy was tried against which Source and how it responded.
+      operationId: getIngestRun
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Run returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: '' }
+                  run: { $ref: '#/components/schemas/IngestRun' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ══════════════════════════════════════════════════
+  # ST-102 — ANALYSIS
+  # ══════════════════════════════════════════════════
+
+  /v1/people/{person_id}/analyze:
+    post:
+      tags: [Analysis]
+      summary: Analyse a person into traits and create their agent
+      description: >
+        Reads the ingested `source_profiles`, sends them to the LLM Engine
+        with schema-constrained output, and writes `profile_traits` and
+        `agent_personas`.
+
+        If the LLM is unavailable or returns schema-invalid output twice,
+        the Taxonomy Engine takes over and the response reports
+        `generated_by: taxonomy`.
+
+        Strips instruction-like content from scraped text before the LLM call.
+      operationId: analyzePerson
+      parameters:
+        - $ref: '#/components/parameters/PersonId'
+      responses:
+        '200':
+          description: Analysis completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: '' }
+                  person_id: { type: integer, example: 7 }
+                  generated_by: { type: string, enum: [llm, taxonomy], example: llm }
+                  model_used: { type: string, example: gemini-3.1-flash-lite }
+                  total_traits: { type: integer, example: 11 }
+                  low_confidence: { type: boolean, example: false }
+                  counts_by_type:
+                    type: object
+                    example: { hobby: 3, interest: 4, need: 2, value: 1, dealbreaker: 1 }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Person has not been ingested yet
+          content:
+            application/json:
+              examples:
+                not_ingested:
+                  value:
+                    status: error
+                    error_code: NOT_INGESTED
+                    reason: "Person 7 has ingest_state 'pending'. Run POST /v1/people/7/ingest first."
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/people/{person_id}/profile:
+    get:
+      tags: [Analysis]
+      summary: Get the analysed profile page payload
+      description: >
+        The profile page data: agent persona, traits grouped by type, both
+        source records with provenance, and the confidence summary. This is
+        the endpoint the profile screen renders.
+      operationId: getProfile
+      parameters:
+        - $ref: '#/components/parameters/PersonId'
+      responses:
+        '200':
+          description: Profile returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: '' }
+                  profile: { $ref: '#/components/schemas/ProfilePage' }
+              examples:
+                full_profile:
+                  value:
+                    success: true
+                    message: ''
+                    profile:
+                      person_id: 7
+                      display_name: Ada Okonkwo
+                      agent:
+                        agent_name: Scout
+                        tone: warm
+                        summary: "An engineer who plans every weekend around trails and strong coffee."
+                        guardrails: "Never claims to have met her. Never states a fact not in her two sources."
+                      linkedin_url: https://www.linkedin.com/in/adaokonkwo/
+                      instagram_handle: ada.travels
+                      generated_by: llm
+                      sources:
+                        - source: linkedin
+                          success: true
+                          winning_strategy: jina_reader
+                        - source: instagram
+                          success: true
+                          winning_strategy: ig_web_profile_info
+                      traits:
+                        hobbies: [{ label: trail running, confidence: 0.92, provenance_source: instagram, evidence_quote: "trail runner" }]
+                        interests: [{ label: climate tech, confidence: 0.88, provenance_source: cross_source, evidence_quote: "climate tech" }]
+                        needs: [{ label: an ambitious partner, confidence: 0.81, provenance_source: instagram, evidence_quote: "looking for someone ambitious" }]
+                        values: [{ label: sustainability, confidence: 0.77, provenance_source: linkedin, evidence_quote: "sustainability-first team" }]
+                        dealbreakers: [{ label: long-distance only, confidence: 0.7, provenance_source: inferred, evidence_quote: '' }]
+                      total_traits: 11
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ══════════════════════════════════════════════════
+  # ST-103 — AGENT DATING
+  # ══════════════════════════════════════════════════
+
+  /v1/dates/run:
+    post:
+      tags: [Dating]
+      summary: Run agent-to-agent dates
+      description: >
+        Pairs people and runs a multi-round date for each pair. Three pairing
+        modes:
+
+        * `top_n` (default) — the top N ranked pairs per person from ST-104
+        * `all` — every unordered pair
+        * `explicit` — only the `pairs` supplied in the body
+
+        Each session runs 3 rounds (6 messages minimum) and ends with a
+        verdict. Sessions are persisted even when incomplete.
+
+        A run of ~70 pairs takes 50-90s at the concurrency cap of 3, so this
+        executes as a background task. The response returns immediately with
+        a `run_id`; the UI polls `GET /v1/dates` and renders sessions as they
+        land. When the run completes inline, `status` is `complete` and the
+        counts are final.
+      operationId: runDates
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunDatesRequest'
+            examples:
+              top_five:
+                summary: Top 5 ranked pairs per person
+                value: { mode: top_n, top_n: 5, rounds: 3 }
+              single_pair:
+                summary: One specific pair
+                value:
+                  mode: explicit
+                  pairs: [[7, 12]]
+                  rounds: 3
+      responses:
+        '200':
+          description: Dating run accepted (or completed inline)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: '' }
+                  run_id: { type: integer, example: 9 }
+                  status: { type: string, enum: [running, complete] }
+                  pairs_selected: { type: integer, example: 64 }
+                  sessions_completed: { type: integer, example: 64 }
+                  sessions_failed: { type: integer, example: 0 }
+                  llm_sessions: { type: integer, example: 64 }
+                  deterministic_sessions: { type: integer, example: 0 }
+        '409':
+          description: Fewer than two analysable people
+          content:
+            application/json:
+              examples:
+                not_enough:
+                  value:
+                    status: error
+                    error_code: INSUFFICIENT_PEOPLE
+                    reason: "Need at least 2 people with a completed analysis. Found 1."
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/dates:
+    get:
+      tags: [Dating]
+      summary: List date sessions
+      description: Returns sessions newest-first with both participants' names and the verdict.
+      operationId: listDates
+      parameters:
+        - name: person_id
+          in: query
+          required: false
+          schema: { type: integer }
+          description: Only sessions this person took part in
+        - name: verdict
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [second_date, friendzone, unmatched]
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 50, maximum: 300 }
+      responses:
+        '200':
+          description: Sessions returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: '' }
+                  total: { type: integer, example: 64 }
+                  sessions:
+                    type: array
+                    items: { $ref: '#/components/schemas/DateSessionSummary' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/dates/{session_id}:
+    get:
+      tags: [Dating]
+      summary: Get a full date transcript
+      description: >
+        The complete ordered transcript with `cited_evidence` on every
+        message, plus the verdict, verdict reasoning, and the proposed
+        concrete date. This is the endpoint the dating-room screen renders.
+      operationId: getDateSession
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Transcript returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: '' }
+                  session: { $ref: '#/components/schemas/DateSessionDetail' }
+              examples:
+                second_date:
+                  value:
+                    success: true
+                    message: ''
+                    session:
+                      session_id: 12
+                      initiator: { person_id: 7, display_name: Ada Okonkwo, agent_name: Scout }
+                      responder: { person_id: 19, display_name: Marco Silva, agent_name: Anchor }
+                      status: complete
+                      rounds_completed: 3
+                      predicted_score: 78.4
+                      verdict: second_date
+                      proposed_date: "Saturday 08:30 — the ridge trail near Sintra, then coffee at a third-wave roastery."
+                      verdict_reasoning: "Both list trail running and third-wave coffee. Neither flags long distance as a dealbreaker. Shared relocation to Lisbon in 2024."
+                      engine: llm
+                      llm_succeeded: true
+                      messages:
+                        - round_no: 1
+                          speaker: initiator
+                          speaker_agent: Scout
+                          content: "Your feed is almost entirely ridgelines and filter coffee. I run the same two things every weekend — though I'm slower uphill and better at the espresso part."
+                          cited_evidence: [{ trait_type: hobby, label: trail running, source: instagram }]
+                          round_chemistry: 0.72
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ══════════════════════════════════════════════════
+  # ST-104 — RANKING
+  # ══════════════════════════════════════════════════
+
+  /v1/rank:
+    post:
+      tags: [Ranking]
+      summary: Compute compatibility scores for every pair
+      description: >
+        Deterministic. Scores all analysable people across exactly eight
+        weighted dimensions, applies dealbreaker penalties, then writes
+        `match_scores` including `rank_for_a`, `rank_for_b`, and
+        `mutual_top_pick`. Idempotent — re-running replaces prior results.
+      operationId: computeRankings
+      responses:
+        '200':
+          description: Rankings computed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: '' }
+                  people_ranked: { type: integer, example: 25 }
+                  pairs_scored: { type: integer, example: 300 }
+                  mutual_top_picks: { type: integer, example: 6 }
+                  top_match:
+                    type: object
+                    example: { person_a: Ada Okonkwo, person_b: Marco Silva, total_score: 84.1 }
+        '409':
+          description: Fewer than two analysable people
+          content:
+            application/json:
+              examples:
+                not_enough:
+                  value:
+                    status: error
+                    error_code: INSUFFICIENT_PEOPLE
+                    reason: "Need at least 2 analysed people to rank. Found 1."
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/people/{person_id}/rankings:
+    get:
+      tags: [Ranking]
+      summary: Get one person's ranked list of who fits them best
+      description: >
+        Returns every other analysed person ordered by that person's rank
+        ascending, each with the eight dimension scores, shared signals,
+        conflict signals, and the human-readable rationale.
+      operationId: getPersonRankings
+      parameters:
+        - $ref: '#/components/parameters/PersonId'
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 10, maximum: 50 }
+      responses:
+        '200':
+          description: Rankings returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: '' }
+                  person_id: { type: integer, example: 7 }
+                  total_candidates: { type: integer, example: 24 }
+                  rankings:
+                    type: array
+                    items: { $ref: '#/components/schemas/RankingEntry' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/matches/matrix:
+    get:
+      tags: [Ranking]
+      summary: N x N compatibility matrix
+      description: >
+        Every analysed person against every other, as a flat pair list plus a
+        ready-to-render matrix. Powers the heatmap on the rankings screen.
+      operationId: getMatchMatrix
+      responses:
+        '200':
+          description: Matrix returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: '' }
+                  people:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        person_id: { type: integer, example: 7 }
+                        display_name: { type: string, example: Ada Okonkwo }
+                  matrix:
+                    type: array
+                    description: matrix[i][j] is the score for people[i] vs people[j]; null on the diagonal
+                    items:
+                      type: array
+                      items:
+                        type: number
+                        format: float
+                        nullable: true
+                    example: [[null, 84.1, 41.0], [84.1, null, 63.7], [41.0, 63.7, null]]
+                  pairs:
+                    type: array
+                    items: { $ref: '#/components/schemas/RankingEntry' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ══════════════════════════════════════════════════
+  # SEED
+  # ══════════════════════════════════════════════════
+
+  /v1/seed:
+    post:
+      tags: [Seed]
+      summary: Load the 25-person demonstration roster
+      description: >
+        Loads the seeded roster of 25 real people from `data/seed/roster.json`.
+        By default this is a no-op when the roster is already present, so the
+        deployed demo opens pre-populated without any typing.
+      operationId: seedRoster
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reset: { type: boolean, default: false, description: Wipe existing people first }
+                run_pipeline: { type: boolean, default: false, description: Also run ingest, analyse, rank and date }
+      responses:
+        '200':
+          description: Seed completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: '' }
+                  created: { type: integer, example: 25 }
+                  skipped_existing: { type: integer, example: 0 }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+
+  parameters:
+    PersonId:
+      name: person_id
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+      description: Primary key of the person
+
+  responses:
+    InvalidInput:
+      description: Request failed validation
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          examples:
+            bad_linkedin:
+              value:
+                status: error
+                error_code: INVALID_INPUT
+                reason: "linkedin_url must match https://www.linkedin.com/in/<slug> — got 'https://twitter.com/x'."
+            missing_source:
+              value:
+                status: error
+                error_code: MISSING_SOURCE
+                reason: "Both a LinkedIn URL and an Instagram handle are required. Missing: instagram."
+    NotFound:
+      description: Resource does not exist
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          examples:
+            missing:
+              value:
+                status: error
+                error_code: NOT_FOUND
+                reason: "Person 999 not found."
+    InternalError:
+      description: Unrecoverable server error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          examples:
+            generic:
+              value:
+                status: error
+                error_code: INTERNAL_ERROR
+                reason: "An unexpected error occurred."
+
+  schemas:
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        status: { type: string, enum: [error] }
+        error_code:
+          type: string
+          enum:
+            [INVALID_INPUT, MISSING_SOURCE, DUPLICATE_PERSON, NOT_FOUND, NOT_INGESTED,
+             INSUFFICIENT_PEOPLE, LLM_UNAVAILABLE, DATABASE_ERROR, INTERNAL_ERROR]
+        reason:
+          type: string
+          description: Plain-language message naming the recovery action
+
+    HealthResponse:
+      type: object
+      properties:
+        status: { type: string, example: healthy }
+        server: { type: string, example: agentic-dating }
+        version: { type: string, example: 1.0.0 }
+
+    ReadinessResponse:
+      type: object
+      properties:
+        status: { type: string, enum: [ready, not_ready] }
+        server: { type: string, example: agentic-dating }
+        version: { type: string, example: 1.0.0 }
+        components:
+          type: object
+          example:
+            database: ready
+            llm: ready
+            taxonomy: ready
+        llm_model: { type: string, nullable: true, example: gemini-3.1-flash-lite }
+
+    PersonSummary:
+      type: object
+      properties:
+        person_id: { type: integer, example: 7 }
+        display_name: { type: string, example: Ada Okonkwo }
+        linkedin_url: { type: string, example: 'https://www.linkedin.com/in/adaokonkwo/' }
+        instagram_handle: { type: string, example: ada.travels }
+        ingest_state:
+          type: string
+          enum: [pending, partial, ingested, failed]
+          example: ingested
+        profile_completeness: { type: integer, minimum: 0, maximum: 100, example: 92 }
+        total_traits: { type: integer, example: 11 }
+        agent_name: { type: string, nullable: true, example: Scout }
+
+    PersonDetail:
+      allOf:
+        - $ref: '#/components/schemas/PersonSummary'
+        - type: object
+          properties:
+            city: { type: string, nullable: true, example: Lisbon }
+            created_at: { type: string, format: date-time }
+            sources:
+              type: array
+              items: { $ref: '#/components/schemas/SourceProfile' }
+
+    SourceProfile:
+      type: object
+      properties:
+        source: { type: string, enum: [linkedin, instagram] }
+        source_url: { type: string }
+        winning_strategy:
+          type: string
+          nullable: true
+          enum: [li_direct, li_jina_reader, li_jina_reader_json, ig_web_profile_info, ig_embed, ig_jina_reader, null]
+        http_status: { type: integer, nullable: true, example: 200 }
+        success: { type: boolean, example: true }
+        failure_reason: { type: string, nullable: true }
+        fetch_duration_ms: { type: integer, nullable: true, example: 2140 }
+        profile_fields:
+          type: object
+          nullable: true
+          description: Structured fields extracted from the source payload
+          example: { name: Ada Okonkwo, bio: 'trail runner | filter coffee', headline: 'Climate engineer' }
+        fetched_at: { type: string, format: date-time }
+
+    IngestRun:
+      type: object
+      properties:
+        run_id: { type: integer }
+        trigger_type: { type: string, enum: [manual, seed, bulk] }
+        persons_total: { type: integer, example: 25 }
+        persons_succeeded: { type: integer, example: 22 }
+        persons_partial: { type: integer, example: 2 }
+        persons_failed: { type: integer, example: 1 }
+        strategy_log:
+          type: array
+          items:
+            type: object
+            properties:
+              person_id: { type: integer }
+              source: { type: string }
+              strategy: { type: string }
+              outcome: { type: string, enum: [success, blocked, rate_limited, timeout, error] }
+              http_status: { type: integer, nullable: true }
+              duration_ms: { type: integer }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }
+
+    CreatePersonRequest:
+      type: object
+      required: [display_name, linkedin_url, instagram_handle]
+      properties:
+        display_name: { type: string, minLength: 1, maxLength: 200, example: Ada Okonkwo }
+        linkedin_url: { type: string, minLength: 10, maxLength: 500 }
+        instagram_handle:
+          type: string
+          minLength: 1
+          maxLength: 30
+          description: >
+            Canonical handle, no '@'. `nasa`, `@nasa`, `instagram.com/nasa`
+            and the full URL all normalise to `nasa`.
+      additionalProperties: false
+
+    RunDatesRequest:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [top_n, all, explicit]
+          default: top_n
+        top_n: { type: integer, minimum: 1, maximum: 25, default: 5 }
+        rounds: { type: integer, minimum: 2, maximum: 5, default: 3 }
+        pairs:
+          type: array
+          description: Only used when mode is 'explicit'
+          items:
+            type: array
+            items: { type: integer }
+            minItems: 2
+            maxItems: 2
+
+    DateSessionSummary:
+      type: object
+      properties:
+        session_id: { type: integer }
+        initiator: { type: string, example: Ada Okonkwo }
+        responder: { type: string, example: Marco Silva }
+        initiator_agent: { type: string, example: Scout }
+        responder_agent: { type: string, example: Anchor }
+        verdict: { type: string, enum: [second_date, friendzone, unmatched], nullable: true }
+        rounds_completed: { type: integer, example: 3 }
+        predicted_score: { type: number, nullable: true, example: 78.4 }
+        engine: { type: string, enum: [llm, deterministic] }
+        started_at: { type: string, format: date-time }
+
+    DateSessionDetail:
+      allOf:
+        - $ref: '#/components/schemas/DateSessionSummary'
+        - type: object
+          properties:
+            status: { type: string, enum: [pending, running, complete, failed] }
+            llm_succeeded: { type: boolean, example: true }
+            proposed_date: { type: string, nullable: true }
+            verdict_reasoning: { type: string, nullable: true }
+            messages:
+              type: array
+              items: { $ref: '#/components/schemas/DateMessage' }
+
+    DateMessage:
+      type: object
+      properties:
+        round_no: { type: integer, minimum: 1, example: 1 }
+        speaker: { type: string, enum: [initiator, responder, system] }
+        speaker_agent: { type: string, example: Scout }
+        content: { type: string }
+        cited_evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              trait_type: { type: string, example: hobby }
+              label: { type: string, example: trail running }
+              source: { type: string, enum: [linkedin, instagram, cross_source, inferred] }
+        round_chemistry: { type: number, minimum: 0, maximum: 1, nullable: true }
+
+    ProfilePage:
+      type: object
+      properties:
+        person_id: { type: integer }
+        display_name: { type: string }
+        agent:
+          type: object
+          properties:
+            agent_name: { type: string, example: Scout }
+            tone: { type: string, enum: [warm, dry, playful, direct, poetic] }
+            summary: { type: string }
+            guardrails: { type: string }
+        linkedin_url: { type: string }
+        instagram_handle: { type: string }
+        generated_by: { type: string, enum: [llm, taxonomy] }
+        sources:
+          type: array
+          items: { $ref: '#/components/schemas/SourceProfile' }
+        traits:
+          type: object
+          description: Trait lists keyed by type — the profile page renders these as sections
+          additionalProperties:
+            type: array
+            items: { $ref: '#/components/schemas/Trait' }
+        total_traits: { type: integer }
+
+    Trait:
+      type: object
+      properties:
+        label: { type: string, example: trail running }
+        confidence: { type: number, minimum: 0, maximum: 1, example: 0.92 }
+        provenance_source:
+          type: string
+          enum: [linkedin, instagram, cross_source, inferred]
+        provenance_strategy: { type: string, nullable: true, example: gemini-3.1-flash-lite }
+        evidence_quote: { type: string, example: trail runner }
+
+    RankingEntry:
+      type: object
+      properties:
+        person_id: { type: integer, example: 19 }
+        display_name: { type: string, example: Marco Silva }
+        agent_name: { type: string, nullable: true, example: Anchor }
+        rank: { type: integer, example: 1 }
+        total_score: { type: number, example: 84.1 }
+        dimension_scores:
+          type: object
+          description: The eight weighted dimensions
+          example:
+            interest_overlap: 21.0
+            hobby_complement: 15.4
+            value_alignment: 12.2
+            need_satisfaction: 11.0
+            energy_match: 9.8
+            life_stage: 7.1
+            geography: 5.2
+            dealbreaker_conflict: 2.4
+        shared_signals:
+          type: array
+          items: { type: string }
+          example: [trail running, third-wave coffee, Lisbon]
+        conflict_signals:
+          type: array
+          items: { type: string }
+          example: []
+        rationale: { type: string }
+        mutual_top_pick: { type: boolean, example: true }
